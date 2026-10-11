@@ -9,7 +9,7 @@
 
 # %% Setup
 RUNS = {"main": "bt_main", "no_noise_aug": "bt_nonoise"}    # second one optional
-REPO = "https://github.com/YOUR_USERNAME/echofind.git"     # <-- change this
+REPO = "https://github.com/allurimeghana06/echofind.git"
 import os, sys, subprocess
 if not os.path.exists("/tmp/echofind"):
     url = REPO

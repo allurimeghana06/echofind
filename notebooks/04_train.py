@@ -32,7 +32,7 @@ if CFG["SMOKE_TEST"]:
     CFG.update(EPOCHS=5, EVAL_EVERY=1, RUN_NAME=CFG["RUN_NAME"] + "_smoke")
 
 # %% Setup
-REPO = "https://github.com/YOUR_USERNAME/echofind.git"     # <-- change this
+REPO = "https://github.com/allurimeghana06/echofind.git"
 import os, sys, subprocess
 if not os.path.exists("/tmp/echofind"):
     url = REPO

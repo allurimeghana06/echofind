@@ -16,7 +16,7 @@
 # Only *_eval banks are used for queries and OOD. Training never sees them.
 
 # %% Setup: get the code
-REPO = "https://github.com/YOUR_USERNAME/echofind.git"     # <-- change this
+REPO = "https://github.com/allurimeghana06/echofind.git"
 import os, sys, subprocess
 if not os.path.exists("/tmp/echofind"):
     url = REPO
