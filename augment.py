@@ -1,8 +1,8 @@
 """Phase 1: stochastic augmentation pipeline (view generation for SSL).
 
-Design (InfoMin, Tian et al. 2020): change everything a real phone recording in a cafe
-would change, keep everything that identifies the song.
+Two kinds of views, one per head of the two-head encoder:
 
+IDENTITY views (nuisance only; "the same recording through a different phone in a cafe")
   Waveform stage (simulates the acoustic channel, NAFP-style):
     1. reverb      - convolve with a room impulse response (real or synthetic)
     2. noise       - environmental noise + babble ("cafe chatter") at a random SNR
@@ -10,10 +10,15 @@ would change, keep everything that identifies the song.
     4. gain        - random loudness
   Spectrogram stage:
     5. SpecAugment - random frequency and time masks
-  Plus, done by the crop policy: the two views come from DIFFERENT moments of the
-  same track, which teaches "a 5 s piece belongs to the whole song".
+  Crop policy: both identity views come from the SAME moment (shifted <= 0.5 s).
 
-Never used: pitch shift, heavy time stretch -> those change the song's identity.
+STYLE view ("a different part of the song, played slightly differently")
+  Crop policy: a DIFFERENT, non-overlapping segment of the same track.
+    6. speed perturbation +-8% (tempo and pitch move together)
+    7. mel shift +-2 bins (~1-2 semitones)
+    8. light nuisance (SNR 10-30 dB, less reverb) + SpecAugment
+  Style augmentations are never applied to identity views: they would destroy the
+  exact-recording detail that fingerprinting relies on.
 
 The class works on CPU or GPU, on one clip (T,) or a batch (B, T). If no noise/RIR
 banks are given it uses the small bundled set in assets/, and if that is missing too it
@@ -88,9 +93,14 @@ class AugmentationPipeline(nn.Module):
     """Creates two augmented log-mel views of an audio clip.
 
     Main entry points
-      pipeline(audio)                -> (view1, view2), each (1, 128, 431) for one clip
-      pipeline.views_from_crops(a,b) -> batched views, used by the GPU training loop
+      pipeline(audio)                -> (view1, view2), each (1, 128, 431): the IDENTITY pair
+                                        (same moment +-0.5 s, two independent noisy rooms)
+      pipeline.view(crops)           -> identity-style view of a batch (nuisance only)
+      pipeline.style_view(long_crops)-> style view: speed perturbation + mel shift + light nuisance
       pipeline.augment_wave(wav)     -> augmented waveform only (for listening tests)
+
+    The identity head never sees style augmentations (they would break fingerprinting);
+    the style head's second view always gets them.
 
     `audio` may be a file path, numpy array, or tensor (T,) / (B, T).
     """
@@ -100,6 +110,9 @@ class AugmentationPipeline(nn.Module):
                  snr_db=(0.0, 20.0), p_reverb=0.8, p_noise=0.9, p_babble=0.5,
                  p_reverb_after_noise=0.5, p_eq=0.8, eq_db=6.0, gain_db=(-6.0, 6.0),
                  n_freq_masks=2, max_freq_mask=16, n_time_masks=2, max_time_mask=40,
+                 max_shift_seconds=0.5,
+                 style_speed=(0.92, 1.08), style_mel_shift=2,
+                 light_snr_db=(10.0, 30.0), light_p_reverb=0.3,
                  seed=None):
         super().__init__()
         self.sr = sr
@@ -109,6 +122,9 @@ class AugmentationPipeline(nn.Module):
         self.p_eq, self.eq_db, self.gain_db = p_eq, eq_db, gain_db
         self.fm = (n_freq_masks, max_freq_mask)
         self.tm = (n_time_masks, max_time_mask)
+        self.max_shift = int(max_shift_seconds * sr)
+        self.style_speed, self.style_mel_shift = style_speed, style_mel_shift
+        self.light_snr_db, self.light_p_reverb = light_snr_db, light_p_reverb
         self.logmel = LogMel(sr=sr)
         self.gen = torch.Generator()
         self.gen.manual_seed(seed if seed is not None else int(np.random.SeedSequence().entropy % 2**31))
@@ -161,8 +177,9 @@ class AugmentationPipeline(nn.Module):
         wet = wet * (_rms(x) / (_rms(wet) + 1e-8))
         return torch.where(mask, wet, x)
 
-    def augment_wave(self, wav):
-        """wav: (T,) or (B, T) float tensor -> augmented waveform, same shape."""
+    def augment_wave(self, wav, light=False):
+        """wav: (T,) or (B, T) float tensor -> augmented waveform, same shape.
+        light=True: milder noise (SNR 10-30 dB) and less reverb, used for the style view."""
         squeeze = wav.dim() == 1
         x = wav.unsqueeze(0) if squeeze else wav
         x = x.float()
@@ -170,7 +187,9 @@ class AugmentationPipeline(nn.Module):
         dev = x.device
         x = x - x.mean(dim=-1, keepdim=True)
 
-        do_rev = self._rand(B, dev) < self.p_reverb
+        p_rev = self.light_p_reverb if light else self.p_reverb
+        snr_range = self.light_snr_db if light else self.snr_db
+        do_rev = self._rand(B, dev) < p_rev
         rev_after = self._rand(B, dev) < self.p_rev_after
         x = self._reverb(x, do_rev & ~rev_after)                 # reverb the music only
 
@@ -180,7 +199,7 @@ class AugmentationPipeline(nn.Module):
         use_bab = (self._rand(B, dev) < self.p_babble).float()
         w = self._rand(B, dev, 0.3, 1.0)                         # balance of the two noises
         n = noise * (1 - use_bab * (1 - w)) + bab * use_bab * w
-        snr = self._rand(B, dev, *self.snr_db)
+        snr = self._rand(B, dev, *snr_range)
         # SNR mixing: scale noise so 20*log10(rms(signal)/rms(noise)) = snr
         n = n * (_rms(x) / (_rms(n) + 1e-8)) * 10 ** (-snr / 20)
         add = (self._rand(B, dev) < self.p_noise).float()
@@ -233,19 +252,51 @@ class AugmentationPipeline(nn.Module):
         return self
 
     def view(self, wav):
-        """One augmented view: waveform (B, T) -> log-mel (B, 1, M, F)."""
+        """Identity view (nuisance augmentations only): waveform (B, T) -> log-mel (B, 1, M, F)."""
         return self.spec_augment(self.logmel.to(wav.device)(self.augment_wave(wav)))
+
+    # ---------------------------------------------------------------- style view
+    def speed_perturb(self, wav, T):
+        """Resample each clip by a random factor (changes tempo AND pitch together, like a
+        record played slightly fast/slow). wav: (B, L) with L >= T * max factor -> (B, T)."""
+        B, L = wav.shape
+        lo, hi = self.style_speed
+        r = (torch.rand(B, generator=self.gen) * (hi - lo) + lo).tolist()
+        out = []
+        for b in range(B):
+            n_new = max(T, int(round(L / r[b])))
+            y = torch.nn.functional.interpolate(wav[b].view(1, 1, -1).float(), size=n_new,
+                                                mode="linear", align_corners=False)[0, 0]
+            out.append(y[:T])
+        return torch.stack(out)
+
+    def mel_shift(self, spec):
+        """Shift each spectrogram up/down by up to `style_mel_shift` mel bins (~1-2 semitones
+        in the mid range); edges are filled by repeating the border bin."""
+        B, _, M, F = spec.shape
+        k = torch.randint(-self.style_mel_shift, self.style_mel_shift + 1, (B,), generator=self.gen)
+        idx = (torch.arange(M).view(1, M) - k.view(B, 1)).clamp(0, M - 1).to(spec.device)
+        return torch.gather(spec, 2, idx.view(B, 1, M, 1).expand(B, 1, M, F))
+
+    def style_view(self, wav_long):
+        """Style view: speed perturbation -> light nuisance -> log-mel -> mel shift -> SpecAugment.
+        wav_long: (B, L) crops at least 1.1 x crop length (room for the speed change)."""
+        x = self.speed_perturb(wav_long, self.crop)
+        x = self.augment_wave(x, light=True)
+        return self.spec_augment(self.mel_shift(self.logmel.to(x.device)(x)))
 
     # ---------------------------------------------------------------- public API
     def random_crops(self, wav):
-        """Two crops of `self.crop` samples from different random positions of one clip."""
+        """Identity pair: one random crop and a second one shifted by at most +-0.5 s."""
         T = wav.shape[-1]
         if T <= self.crop:
             pad = torch.zeros(self.crop - T)
             c = torch.cat([wav, pad])
             return c, c.clone()
-        s = torch.randint(0, T - self.crop + 1, (2,), generator=self.gen).tolist()
-        return wav[s[0]:s[0] + self.crop], wav[s[1]:s[1] + self.crop]
+        s = int(torch.randint(0, T - self.crop + 1, (1,), generator=self.gen))
+        d = int(torch.randint(-self.max_shift, self.max_shift + 1, (1,), generator=self.gen))
+        s2 = min(max(0, s + d), T - self.crop)
+        return wav[s:s + self.crop], wav[s2:s2 + self.crop]
 
     @torch.no_grad()
     def views_from_crops(self, c1, c2):
