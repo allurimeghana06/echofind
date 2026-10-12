@@ -34,7 +34,12 @@ import torch.nn as nn
 from features import SR, LogMel, load_audio, to_tensor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_ASSETS = os.path.join(HERE, "assets", "aug_assets.npz")
+# The noise pack is a .npz (a zip of .npy files). Browsers/Macs sometimes rename it on
+# download (aug_assets.zip, aug_assets.npz.zip); all of these load the same way.
+_ASSET_NAMES = ("aug_assets.npz", "aug_assets.npz.zip", "aug_assets.zip")
+DEFAULT_ASSETS = next((os.path.join(HERE, "assets", n) for n in _ASSET_NAMES
+                       if os.path.exists(os.path.join(HERE, "assets", n))),
+                      os.path.join(HERE, "assets", "aug_assets.npz"))
 
 
 # ----------------------------------------------------------------------------- banks
